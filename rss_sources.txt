@@ -1,4 +1,4 @@
-https://silkwayrally.com/news-ru/feed/
+HTML:https://silkwayrally.com/news-ru/
 http://vdrifte.ru/rss
 https://bestcarweb.jp/scoop/feed
 https://autosport.com.ru/rss
