@@ -1,100 +1,92 @@
-import json
-import os
-import requests
-from rss_reader import read_rss_sources, fetch_news
+import os, datetime, traceback
+from typing import List
+from logging_utils import setup_logger, RunReport, save_run_report
+from rss_reader import load_sources, parse_feed, mark_new, update_sent_log
+from telegram_sender import safe_post, PostResult
+# из ваших файлов — не трогаем внутренности:
 from rewrite import rewrite_news
 from topic_selector import extract_image_topic
-from telegram_sender import send_telegram_message_with_photo, send_telegram_message_without_photo
 
-TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
-UNSPLASH_ACCESS_KEY = "7UmMOEVE5pNZxC6Mu1R6ZXvpbOyuAKL41-yUfrtoMdQ"
+BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+CHAT_ID   = os.getenv("TG_CHAT_ID", "")
 
-SENT_LOG = "sent_log.json"
+logger = setup_logger("main")
 
-# Загрузка лога
-if os.path.exists(SENT_LOG):
-    with open(SENT_LOG, "r") as f:
-        sent_links = set(json.load(f))
-else:
-    sent_links = set()
+def build_message(entry, rewritten_text: str) -> str:
+    # Делайте здесь формат под ваш канал
+    title = entry.title or "(без заголовка)"
+    link = entry.link or ""
+    return f"<b>{title}</b>\n\n{rewritten_text}\n\n<a href='{link}'>Источник</a>"
 
-print(f"📅 Загружено {len(sent_links)} ссылок из лога")
+def process_source(url: str, report_obj) -> None:
+    entries, src = parse_feed(url)
+    report_obj.sources.append(src)
 
-def save_log():
-    print(f"📏 Сохраняем {len(sent_links)} ссылок в sent_log.json")
-    with open(SENT_LOG, "w") as f:
-        json.dump(list(sent_links), f)
+    # определяем новые
+    new_entries, n_new = mark_new(entries)
+    src.new_found = n_new
+    src.skipped = src.fetched - n_new
 
-# 💡 Получение URL фото с Unsplash
+    logger.info("Источник: %s | всего=%d, новые=%d, пропуск=%d",
+                url, src.fetched, src.new_found, src.skipped)
 
-def get_unsplash_image_url(query):
-    url = "https://api.unsplash.com/search/photos"
-    params = {
-        "query": query,
-        "orientation": "landscape",
-        "per_page": 1,
-        "client_id": UNSPLASH_ACCESS_KEY,
-    }
+    # постим только те, что проходят фильтр should_post
+    successful_to_log = []
+    for e in new_entries:
+        try:
+            if not should_post(e.title, e.summary_html):
+                logger.info("Фильтр отклонил: %s", e.title)
+                continue
+            rewritten = rewrite_article(e.title, e.summary_html, link=e.link)
+            msg = build_message(e, rewritten)
+            res: PostResult = safe_post(BOT_TOKEN, CHAT_ID, msg)
+            if res.ok:
+                src.sent += 1
+                successful_to_log.append(e)
+            else:
+                src.errors.append(f"TG: {res.error}")
+        except Exception as ex:
+            tb = traceback.format_exc()
+            logger.exception("Ошибка при обработке записи: %s", e.link)
+            src.errors.append(f"PROCESS: {ex}")
 
-    try:
-        response = requests.get(url, params=params, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        if data["results"]:
-            return data["results"][0]["urls"]["regular"]
-        else:
-            print("⚠️ Unsplash: нет результатов")
-            return None
-    except Exception as e:
-        print(f"❌ Unsplash API error: {e}")
-        return None
-
-# 🧬 Основной цикл
+    # апдейтим sent_log только успешными отправками
+    if successful_to_log:
+        update_sent_log(successful_to_log)
 
 def main():
-    for url in read_rss_sources():
-        for item in fetch_news(url):
-            if item["link"] in sent_links:
-                print(f"🛑 Пропущено (дубль): {item['link']}")
-                continue
+    started = datetime.datetime.now().isoformat(timespec="seconds")
+    run = RunReport(started_at=started)
 
-            try:
-                headline, body = rewrite_news(item["title"], item["summary"])
+    sources = load_sources()
+    run.total_sources = len(sources)
+    if not sources:
+        logger.warning("Список источников пуст.")
+        return
 
-                # Ищем фото
-                image_url = item.get("image")
-                if not image_url:
-                    topic = extract_image_topic(item["title"], item["summary"])
-                    if topic:
-                        image_url = get_unsplash_image_url(topic)
+    for url in sources:
+        process_source(url, run)
 
-                # Отправка
-                if image_url:
-                    send_telegram_message_with_photo(
-                        title=headline,
-                        link=item["link"],
-                        text=body,
-                        image_url=image_url,
-                        token=TELEGRAM_TOKEN,
-                        chat_id=TELEGRAM_CHAT_ID
-                    )
-                else:
-                    send_telegram_message_without_photo(
-                        title=headline,
-                        link=item["link"],
-                        text=body,
-                        token=TELEGRAM_TOKEN,
-                        chat_id=TELEGRAM_CHAT_ID
-                    )
+    # агрегаты
+    run.total_new_found = sum(s.new_found for s in run.sources)
+    run.total_sent = sum(s.sent for s in run.sources)
+    run.total_errors = sum(len(s.errors) for s in run.sources)
+    run.finished_at = datetime.datetime.now().isoformat(timespec="seconds")
 
-                print(f"✅ Отправлено: {item['link']}")
-                sent_links.add(item["link"])
+    # лог + JSON-отчёт
+    logger.info("=== СВОДКА РАНА ===")
+    for s in run.sources:
+        if s.errors:
+            logger.warning("Источник: %s | новые=%d | отправлено=%d | ошибок=%d",
+                           s.source, s.new_found, s.sent, len(s.errors))
+            for err in s.errors:
+                logger.warning("  • %s", err)
+        else:
+            logger.info("Источник: %s | новые=%d | отправлено=%d | ошибок=0",
+                        s.source, s.new_found, s.sent)
 
-            except Exception as e:
-                print(f"❌ Ошибка: {e}")
-
-    save_log()
+    path = save_run_report(run)
+    logger.info("Отчёт сохранён: %s", path)
 
 if __name__ == "__main__":
     main()
