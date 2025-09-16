@@ -6,7 +6,7 @@ from telegram_sender import safe_post, PostResult
 # из ваших файлов — не трогаем внутренности:
 from rewrite import rewrite_news
 
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("TG_TOKEN", "")
 CHAT_ID   = os.getenv("TG_CHAT_ID", "")
 
 logger = setup_logger("main")
